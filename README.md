@@ -1,6 +1,22 @@
-# 四足场地定位（ROS 2）
+<div align="center">
+
+# 四足机器人场地定位
+
+### Quadruped Field Localization · ROS 2
+
+![ROS 2](https://img.shields.io/badge/ROS_2-22314E?style=flat-square&logo=ros&logoColor=white)
+![C++](https://img.shields.io/badge/C++-00599C?style=flat-square&logo=cplusplus&logoColor=white)
+![LiDAR](https://img.shields.io/badge/Sensor-MID--360-0F766E?style=flat-square)
+
+[系统工作流](#工作流) · [代码组成](#目录) · [构建与配置](#构建) · [运行与检查](#运行入口)
+
+</div>
+
+---
 
 本仓库汇集四足机器人场地定位所使用的 ROS 2 源码、配置和驱动：Livox MID-360 点云驱动、Hipnuc IMU/GNSS 驱动、FAST-LIO2 里程计建图，以及基于 NDT 的已知地图定位。
+
+> A ROS 2 workspace bringing LiDAR, IMU/GNSS, FAST-LIO2 and NDT localization together for a quadruped robot field setup.
 
 > 本仓库只保存可构建的源码与配置版本，不上传场地地图、点云、录像、rosbag、`build/`、`install/` 和 `log/`。将现场地图放到本地后，再在定位参数中设置其绝对路径。
 
@@ -27,7 +43,7 @@ MID-360 点云 + 已知场地 PCD 地图 ──> NDT 定位 ──> map → odom
 
 ## 构建
 
-在具备 ROS 2、PCL、Eigen、Livox SDK 与相应依赖的环境中执行：
+在具备 ROS 2、`colcon`、PCL、Eigen、Livox SDK 与各包声明的依赖的环境中执行：
 
 ```bash
 cd ros2_ws
@@ -45,7 +61,23 @@ source install/setup.bash
 
 ## 运行入口
 
-具体 launch 文件与参数参见 [代码组成与版本说明](docs/代码组成与版本说明.md)。建议按“驱动 → FAST-LIO2 或 NDT 定位 → RViz”的顺序启动，并在真实机器人部署前检查 TF 坐标系与时间戳。
+完成配置与构建后，FAST-LIO2 和 NDT 定位的入口分别是：
+
+```bash
+ros2 launch fast_lio mapping.launch.py
+ros2 launch lidar_localization_ros2 lidar_localization.launch.py
+```
+
+先启动需要的传感器驱动并确认话题有效，再启动建图 / 里程计或已知地图定位。具体驱动命令、活动源码与参数参见[代码组成与版本说明](docs/代码组成与版本说明.md)。
+
+启动前后建议逐项检查：
+
+- MID-360 点云与 IMU 话题的频率、时间戳和外参；
+- PCD 地图实际存在，`map_path` 指向本机的绝对路径；
+- `map → odom → base_link` 的 TF 链、点云对齐及定位初始位姿；
+- 是否使用 FAST-LIO2 发布的 `/Odometry` 和 `/cloud_registered`，与定位 launch 中的 remapping 一致。
+
+仓库保留了部分调试阶段的“副本”文件；当前编译使用的活动文件见[版本说明](docs/代码组成与版本说明.md)。不要把历史副本当作默认运行入口。
 
 ## 许可证与来源
 
