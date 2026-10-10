@@ -1,0 +1,416 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/voxel_grid.h>
+
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <Eigen/Dense>
+#include <vector>
+#include <cmath>
+
+//DYLANYEUNG: MODIFIED:AVAILALE. YET NO COMPLETE TF TREE
+
+// ============================================================
+// ★ 物理安装方向补偿配置 ★ 
+// ============================================================
+// Mid-360 倒置向前安装 (绕X轴转了180度)，开启此项将在内存中把点云掰正
+static constexpr bool LIDAR_INVERTED = true; 
+
+// Hipnuc HI14S2 正置向前安装 (Z朝上，X朝前)
+// 因此直接信任它的原始坐标系，无需翻转符号
+static constexpr bool   SWAP_ROLL_PITCH = true;
+static constexpr double ROLL_SIGN  = 1.0;  
+static constexpr double PITCH_SIGN = -1.0;  
+static constexpr double YAW_SIGN   = 1.0;    
+
+struct GridCell { float min_z, max_z; };
+
+static double wrap_pi(double a) {
+    while (a >  M_PI) a -= 2.0 * M_PI;
+    while (a <= -M_PI) a += 2.0 * M_PI;
+    return a;
+}
+
+class Mid360LocalizationNode : public rclcpp::Node
+{
+public:
+    Mid360LocalizationNode() : Node("mid360_localization_node")
+    {
+        // ★ 核心修复：使用 SensorDataQoS 解决与 Hipnuc 驱动的 QoS 冲突警告
+        auto imu_qos = rclcpp::SensorDataQoS();
+        imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+            "/IMU_data", imu_qos, std::bind(&Mid360LocalizationNode::imu_cb, this, std::placeholders::_1));
+
+        auto sensor_qos = rclcpp::SensorDataQoS();
+        cloud_sub_ = create_subscription<livox_ros_driver2::msg::CustomMsg>(
+            "/livox/lidar", sensor_qos, std::bind(&Mid360LocalizationNode::cloud_cb, this, std::placeholders::_1));
+
+        aligned_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/localization/aligned_cloud", 10);
+        dbg_pub_    = create_publisher<sensor_msgs::msg::PointCloud2>("/localization/debug_cloud", 10);
+        marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/localization/markers", 10);
+        tf_br_      = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+        grid_.resize(200 * 200);
+        RCLCPP_INFO(get_logger(), "[v8.0] 启动 — 适配 Mid-360 倒置 + Hipnuc Z轴纯积分模式！");
+    }
+
+private:
+    double cur_roll_  = 0.0;
+    double cur_pitch_ = 0.0;
+    double cur_yaw_   = 0.0;  
+    bool   imu_ready_ = false;
+
+    // --- 纯积分核心变量 ---
+    rclcpp::Time last_imu_time_;
+    bool   first_imu_ = true;
+    double pure_yaw_ = 0.0; 
+
+    double robot_x_ = 0.0;
+    double robot_y_ = 0.0;
+    double smooth_x_ = 0.0, smooth_y_ = 0.0;
+    bool   first_localize_ = true;
+    bool   is_turning_ = false;
+
+    std::vector<GridCell> grid_;
+
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr cloud_sub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_br_;
+
+    // ============================================================
+    // IMU 回调：获取绝对重力水平 + 纯积分解算 Yaw
+    // ============================================================
+    void imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg)
+    {
+        rclcpp::Time current_time = msg->header.stamp;
+
+        // 1. 提取 Hipnuc 解算好的完美 Roll 和 Pitch (仅用于重力对齐)
+        tf2::Quaternion q(msg->orientation.x, msg->orientation.y, msg->orientation.z, msg->orientation.w);
+        tf2::Matrix3x3 m(q);
+        double raw_roll, raw_pitch, unused_yaw;
+        m.getRPY(raw_roll, raw_pitch, unused_yaw); 
+
+        cur_roll_  = raw_roll * ROLL_SIGN;
+        cur_pitch_ = raw_pitch * PITCH_SIGN;
+
+        // 2. 积分时间戳初始化
+        if (first_imu_) {
+            last_imu_time_ = current_time;
+            pure_yaw_ = 0.0; 
+            first_imu_ = false;
+            imu_ready_ = true; // ★ 核心修复：拿到首帧数据后，必须立刻放行雷达！
+            RCLCPP_INFO(get_logger(), "✅ [HI14S2] 成功接收首帧 IMU，Z 轴积分已启动！");
+            return;
+        }
+
+        // 3. 计算 dt 并更新上一帧时间 (修复时间戳异常导致的死锁)
+        double dt = (current_time - last_imu_time_).seconds();
+        last_imu_time_ = current_time; 
+
+        // 4. 安全积分：只有 dt 正常时才累加，异常时跳过但不阻塞系统
+        if (dt > 0.0 && dt < 0.2) {
+            double omega_z = msg->angular_velocity.z * YAW_SIGN;
+            pure_yaw_ += omega_z * dt;
+            pure_yaw_ = wrap_pi(pure_yaw_);
+            is_turning_ = std::abs(omega_z) > 0.12;
+        } else if (dt < 0.0) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⚠️ IMU 时间倒流或重复帧 (dt=%.4f)，已跳过本次积分", dt);
+        }
+
+        // 接管系统的绝对航向角
+        cur_yaw_ = pure_yaw_;
+        imu_ready_ = true; // ★ 确保雷达始终有最新的姿态可用
+    }
+
+    // ============================================================
+    // 雷达回调：数字翻转点云 + 坐标系对齐
+    // ============================================================
+    void cloud_cb(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
+    {
+        if (!imu_ready_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⏳ 等待 IMU 数据流入...");
+            return;
+        }
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        
+        for (const auto& p : msg->points) {
+            if (LIDAR_INVERTED) {
+                // 核心修复：将倒置的点云强行绕X轴旋转180度掰正
+                // x 不变, y 取反, z 取反
+                cloud->push_back({p.x, -p.y, -p.z});
+            } else {
+                cloud->push_back({p.x, p.y, p.z});
+            }
+        }
+        process(cloud, msg->header);
+    }
+
+    bool is_self(float x, float y) { return (x > -0.7f && x < 0.2f && y > -0.3f && y < 0.3f); }
+
+    void process(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, std_msgs::msg::Header hdr)
+    {
+        // 此时的 cloud 已经是正向的了，可以直接套用正置 IMU 的 Roll 和 Pitch
+        Eigen::Affine3f T = Eigen::Affine3f::Identity();
+        T.rotate(Eigen::AngleAxisf(-cur_pitch_, Eigen::Vector3f::UnitY()));
+        T.rotate(Eigen::AngleAxisf(-cur_roll_,  Eigen::Vector3f::UnitX()));
+        
+        pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::transformPointCloud(*cloud, *aligned, T);
+
+        sensor_msgs::msg::PointCloud2 aligned_msg;
+        pcl::toROSMsg(*aligned, aligned_msg);
+        aligned_msg.header = hdr;
+        aligned_pub_->publish(aligned_msg);
+
+        // Z轴切片滤地 (对齐后的点云，真实的 Z=0 就是物理地面)
+        for (auto& c : grid_) { c.min_z = 999.f; c.max_z = -999.f; }
+        for (const auto& p : aligned->points) {
+            if (p.z < -0.5f || p.z > 0.5f || is_self(p.x, p.y)) continue;
+            int gx = (int)((p.x + 10.f) / 0.1f);
+            int gy = (int)((p.y + 10.f) / 0.1f);
+            if (gx < 0 || gx >= 200 || gy < 0 || gy >= 200) continue;
+            int i = gx * 200 + gy;
+            if (p.z < grid_[i].min_z) grid_[i].min_z = p.z;
+            if (p.z > grid_[i].max_z) grid_[i].max_z = p.z;
+        }
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr walls2d(new pcl::PointCloud<pcl::PointXYZ>());
+        for (const auto& p : aligned->points) {
+            if (p.z < -0.5f || p.z > 0.5f || is_self(p.x, p.y)) continue;
+            int gx = (int)((p.x + 10.f) / 0.1f);
+            int gy = (int)((p.y + 10.f) / 0.1f);
+            if (gx < 0 || gx >= 200 || gy < 0 || gy >= 200) continue;
+            int i = gx * 200 + gy;
+            if (grid_[i].max_z - grid_[i].min_z >= 0.15f)
+                walls2d->push_back({p.x, p.y, 0.f});
+        }
+        
+        if (walls2d->size() < 40) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⚠️ 墙壁点过少 (剩余: %zu < 40)。原因: 周围空间太大、无墙，或雷达放太低扫到了地板！", walls2d->size());
+            return;
+        }
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr clean(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::VoxelGrid<pcl::PointXYZ> vg;
+        vg.setInputCloud(walls2d);
+        vg.setLeafSize(0.05f, 0.05f, 0.05f);
+        vg.filter(*clean);
+        
+        if (clean->size() < 20) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⚠️ 滤波后点云过少 (剩余: %zu < 20)，环境杂点太多被清除！", clean->size());
+            return;
+        }
+
+        sensor_msgs::msg::PointCloud2 dbg;
+        pcl::toROSMsg(*clean, dbg);
+        dbg.header = hdr;
+        dbg_pub_->publish(dbg);
+
+        solve(clean, hdr);
+    }
+
+    void solve(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, std_msgs::msg::Header hdr)
+    {
+        pcl::SACSegmentation<pcl::PointXYZ> seg;
+        seg.setOptimizeCoefficients(true);
+        seg.setModelType(pcl::SACMODEL_LINE);
+        seg.setMethodType(pcl::SAC_RANSAC);
+        seg.setDistanceThreshold(0.05);
+        seg.setMaxIterations(200);
+
+        std::vector<pcl::ModelCoefficients> lines;
+        pcl::ExtractIndices<pcl::PointXYZ> extract;
+        int orig_sz = cloud->size();
+
+        while (cloud->size() > 0.05 * orig_sz && lines.size() < 3) {
+            pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients());
+            pcl::PointIndices::Ptr inliers(new pcl::PointIndices());
+            seg.setInputCloud(cloud);
+            seg.segment(*inliers, *coeff);
+            if (inliers->indices.size() < 15) break;
+
+            float x0 = coeff->values[0], y0 = coeff->values[1];
+            float dx = coeff->values[3], dy = coeff->values[4];
+            float n = std::sqrt(dx*dx + dy*dy);
+            dx /= n; dy /= n;
+            coeff->values[3] = dx; coeff->values[4] = dy;
+
+            float min_t = 1e9, max_t = -1e9;
+            for (int idx : inliers->indices) {
+                float px = cloud->points[idx].x - x0;
+                float py = cloud->points[idx].y - y0;
+                float t = px*dx + py*dy;
+                if (t < min_t) min_t = t;
+                if (t > max_t) max_t = t;
+            }
+            if (max_t - min_t < 1.0f) {
+                extract.setInputCloud(cloud); extract.setIndices(inliers);
+                extract.setNegative(true); extract.filter(*cloud);
+                continue;
+            }
+
+            bool valid = true;
+            if (!lines.empty()) {
+                Eigen::Vector2f dc(dx, dy), pc(x0, y0);
+                for (const auto& prev : lines) {
+                    Eigen::Vector2f dp(prev.values[3], prev.values[4]);
+                    Eigen::Vector2f pp(prev.values[0], prev.values[1]);
+                    float dot = std::abs(dc.dot(dp));
+                    if (dot >= 0.122f && dot <= 0.992f) { valid = false; break; }
+                    if (dot > 0.992f) {
+                        Eigen::Vector2f np(-dp.y(), dp.x());
+                        float dist = std::abs((pc - pp).dot(np));
+                        if (!((dist > 3.4f && dist < 4.6f) || (dist > 5.4f && dist < 6.6f))) {
+                            valid = false; break;
+                        }
+                    }
+                }
+            }
+
+            if (valid) {
+                coeff->values.push_back(min_t);
+                coeff->values.push_back(max_t);
+                lines.push_back(*coeff);
+            }
+
+            extract.setInputCloud(cloud); extract.setIndices(inliers);
+            extract.setNegative(true); extract.filter(*cloud);
+        }
+
+        publish_markers(lines, hdr);
+        
+        if (lines.empty()) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⚠️ 提取失败！未能从当前点云中拟合出符合正交规则的直线，场地可能不规整。");
+            return;
+        }
+
+        double cos_y = std::cos(cur_yaw_);
+        double sin_y = std::sin(cur_yaw_);
+
+        double sum_x = 0, sum_y = 0;
+        int count_x = 0, count_y = 0;
+
+        for (const auto& line : lines) {
+            float x0 = line.values[0], y0 = line.values[1];
+            float dx = line.values[3], dy = line.values[4];
+
+            float proj = x0*dx + y0*dy;
+            float cx = x0 - proj*dx;
+            float cy = y0 - proj*dy;
+            float dist = std::sqrt(cx*cx + cy*cy);
+            if (dist < 0.1f) continue;
+
+            float nx = cx / dist;
+            float ny = cy / dist;
+
+            if (std::abs(nx) > 0.8f) {
+                double wx = (nx > 0) ? cos_y : -cos_y;
+                double wy = (nx > 0) ? sin_y : -sin_y;
+                if (std::abs(wx) > std::abs(wy)) {
+                    double wall_x = (wx > 0) ? 6.0 : 0.0;
+                    sum_x += wall_x - wx * dist; count_x++;
+                } else {
+                    double wall_y = (wy > 0) ? 2.0 : -2.0;
+                    sum_y += wall_y - wy * dist; count_y++;
+                }
+            } else if (std::abs(ny) > 0.8f) {
+                double wx = (ny > 0) ? -sin_y : sin_y;
+                double wy = (ny > 0) ?  cos_y : -cos_y;
+                if (std::abs(wx) > std::abs(wy)) {
+                    double wall_x = (wx > 0) ? 6.0 : 0.0;
+                    sum_x += wall_x - wx * dist; count_x++;
+                } else {
+                    double wall_y = (wy > 0) ? 2.0 : -2.0;
+                    sum_y += wall_y - wy * dist; count_y++;
+                }
+            }
+        }
+
+        double alpha = is_turning_ ? 0.15 : 0.4;
+
+        if (count_x > 0) {
+            double meas_x = sum_x / count_x;
+            smooth_x_ = first_localize_ ? meas_x : smooth_x_ * (1.0 - alpha) + meas_x * alpha;
+            robot_x_ = smooth_x_;
+        }
+        if (count_y > 0) {
+            double meas_y = sum_y / count_y;
+            smooth_y_ = first_localize_ ? meas_y : smooth_y_ * (1.0 - alpha) + meas_y * alpha;
+            robot_y_ = smooth_y_;
+        }
+        if (count_x > 0 || count_y > 0) first_localize_ = false;
+
+        geometry_msgs::msg::TransformStamped t;
+        t.header.stamp    = hdr.stamp;
+        t.header.frame_id = "map";
+        t.child_frame_id  = hdr.frame_id;
+        t.transform.translation.x = robot_x_;
+        t.transform.translation.y = robot_y_;
+        t.transform.translation.z = 0.0;
+        tf2::Quaternion q;
+        q.setRPY(cur_roll_, cur_pitch_, cur_yaw_);
+        t.transform.rotation.x = q.x(); t.transform.rotation.y = q.y();
+        t.transform.rotation.z = q.z(); t.transform.rotation.w = q.w();
+        tf_br_->sendTransform(t);
+
+        
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 100,
+            "🤖 [Hipnuc纯积分] X: %5.2f | Y: %5.2f | 纯净航向角: %5.1f°",
+            robot_x_, robot_y_, cur_yaw_ * 180.0 / M_PI);
+    }
+
+    void publish_markers(const std::vector<pcl::ModelCoefficients>& lines, std_msgs::msg::Header hdr)
+    {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker mk;
+        mk.header = hdr; mk.ns = "lidar_pos"; mk.id = 0;
+        mk.type = visualization_msgs::msg::Marker::CYLINDER;
+        mk.action = visualization_msgs::msg::Marker::ADD;
+        mk.scale.x = mk.scale.y = 0.2; mk.scale.z = 0.1;
+        mk.color.r = 1.0; mk.color.a = 1.0;
+        mk.pose.position.x = mk.pose.position.y = mk.pose.position.z = 0;
+        arr.markers.push_back(mk);
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            visualization_msgs::msg::Marker lm;
+            lm.header = hdr; lm.ns = "walls"; lm.id = i + 2;
+            lm.type = visualization_msgs::msg::Marker::LINE_LIST;
+            lm.action = visualization_msgs::msg::Marker::ADD;
+            lm.scale.x = 0.08; lm.color.g = 1.0; lm.color.a = 0.9;
+            float x0 = lines[i].values[0], y0 = lines[i].values[1];
+            float dx = lines[i].values[3], dy = lines[i].values[4];
+            float mt = lines[i].values.size() > 6 ? lines[i].values[6] : -3.f;
+            float xt = lines[i].values.size() > 7 ? lines[i].values[7] :  3.f;
+            geometry_msgs::msg::Point p1, p2;
+            p1.x = x0 + dx*mt; p1.y = y0 + dy*mt; p1.z = 0;
+            p2.x = x0 + dx*xt; p2.y = y0 + dy*xt; p2.z = 0;
+            lm.points.push_back(p1); lm.points.push_back(p2);
+            arr.markers.push_back(lm);
+        }
+        marker_pub_->publish(arr);
+    }
+};
+
+int main(int argc, char** argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<Mid360LocalizationNode>());
+    rclcpp::shutdown();
+    return 0;
+}

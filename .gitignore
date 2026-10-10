@@ -1,0 +1,25 @@
+# ROS 2 / colcon build products
+build/
+install/
+log/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Site data: maps, point clouds, recordings and exported results
+*.pcd
+*.ply
+*.bag
+*.db3
+*.mcap
+*.mp4
+ros2_ws/src/lidar_localization_ros2/map/
+ros2_ws/src/FAST_LIO_ROS2/PCD/
+ros2_ws/src/FAST_LIO_ROS2/Log/
+
+# Editor / system files
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.DS_Store
